@@ -21,6 +21,7 @@ permissions:
   packages: write
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   APP_NAME: CLIProxyAPI
   IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
 
