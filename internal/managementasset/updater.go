@@ -27,6 +27,7 @@ import (
 const (
 	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
 	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
+	defaultManagementRepoURL     = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	managementAssetName          = "management.html"
 	httpUserAgent                = "CLIProxyAPI-management-updater"
 	managementSyncMinInterval    = 30 * time.Second
@@ -216,6 +217,15 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
+		if shouldUseBundledManagementHTML(panelRepository) {
+			if err := writeBundledManagementHTML(localPath); err != nil {
+				log.WithError(err).Warn("failed to update bundled management asset on disk")
+				return nil, nil
+			}
+			log.Debug("management asset updated from bundled panel")
+			return nil, nil
+		}
+
 		releaseURL := resolveReleaseURL(panelRepository)
 		client := newHTTPClient(proxyURL)
 
@@ -273,6 +283,36 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 	_, err := os.Stat(localPath)
 	return err == nil
+}
+
+func shouldUseBundledManagementHTML(panelRepository string) bool {
+	repo := strings.TrimSpace(panelRepository)
+	if repo == "" {
+		return true
+	}
+
+	normalized := strings.TrimSuffix(strings.ToLower(repo), "/")
+	defaultRepo := strings.ToLower(defaultManagementRepoURL)
+	defaultRelease := strings.ToLower(defaultManagementReleaseURL)
+
+	return normalized == defaultRepo || normalized == defaultRelease
+}
+
+func writeBundledManagementHTML(localPath string) error {
+	if len(bundledManagementHTML) == 0 {
+		return fmt.Errorf("bundled management asset is empty")
+	}
+
+	bundledHash := sha256.Sum256(bundledManagementHTML)
+	existingHash, err := fileSHA256(localPath)
+	if err == nil && strings.EqualFold(existingHash, hex.EncodeToString(bundledHash[:])) {
+		return nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return atomicWriteFile(localPath, bundledManagementHTML)
 }
 
 func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
