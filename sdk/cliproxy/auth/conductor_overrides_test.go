@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -228,5 +229,93 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	}
 	if !state.NextRetryAfter.IsZero() {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
+	}
+}
+
+type deleteTrackingStore struct {
+	deletedIDs []string
+}
+
+func (s *deleteTrackingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+func (s *deleteTrackingStore) Save(context.Context, *Auth) (string, error) {
+	return "", nil
+}
+func (s *deleteTrackingStore) Delete(_ context.Context, id string) error {
+	s.deletedIDs = append(s.deletedIDs, id)
+	return nil
+}
+
+func TestManager_MarkResult_AutoDeletesInvalidFileBackedAuth(t *testing.T) {
+	store := &deleteTrackingStore{}
+	m := NewManager(store, nil, nil)
+	m.SetConfig(&internalconfig.Config{AutoDeleteInvalidAuth: true})
+
+	auth := &Auth{
+		ID:       "auth-delete-me",
+		Provider: "claude",
+		FileName: "auth-delete-me.json",
+		Attributes: map[string]string{
+			"path": "auths/auth-delete-me.json",
+		},
+		Metadata: map[string]any{
+			"email": "user@example.com",
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "test-model",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusUnauthorized, Message: "missing access token"},
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := m.GetByID(auth.ID); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected auth to be deleted from manager")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(store.deletedIDs) != 1 || store.deletedIDs[0] != auth.ID {
+		t.Fatalf("expected Delete to be called once for %q, got %+v", auth.ID, store.deletedIDs)
+	}
+}
+
+func TestManager_MarkResult_DoesNotAutoDeleteAPIKeyAuth(t *testing.T) {
+	store := &deleteTrackingStore{}
+	m := NewManager(store, nil, nil)
+	m.SetConfig(&internalconfig.Config{AutoDeleteInvalidAuth: true})
+
+	auth := &Auth{
+		ID:       "api-key-auth",
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key": "sk-test",
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "test-model",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusUnauthorized, Message: "invalid api key"},
+	})
+
+	if _, ok := m.GetByID(auth.ID); !ok {
+		t.Fatalf("expected API key auth to remain")
+	}
+	if len(store.deletedIDs) != 0 {
+		t.Fatalf("expected no deletes for API key auth, got %+v", store.deletedIDs)
 	}
 }

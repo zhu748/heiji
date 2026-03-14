@@ -1,6 +1,7 @@
 package management
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -54,6 +55,12 @@ type callbackForwarder struct {
 	provider string
 	server   *http.Server
 	done     chan struct{}
+}
+
+type authImportResult struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
 }
 
 var (
@@ -517,7 +524,7 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	c.Data(200, "application/json", data)
 }
 
-// Upload auth file: multipart or raw JSON with ?name=
+// Upload auth file: multipart .json/.zip or raw JSON with ?name=
 func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -526,31 +533,52 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	ctx := c.Request.Context()
 	if file, err := c.FormFile("file"); err == nil && file != nil {
 		name := filepath.Base(file.Filename)
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			c.JSON(400, gin.H{"error": "file must be .json"})
-			return
-		}
-		dst := filepath.Join(h.cfg.AuthDir, name)
-		if !filepath.IsAbs(dst) {
-			if abs, errAbs := filepath.Abs(dst); errAbs == nil {
-				dst = abs
+		switch strings.ToLower(filepath.Ext(name)) {
+		case ".json":
+			dst := filepath.Join(h.cfg.AuthDir, name)
+			if !filepath.IsAbs(dst) {
+				if abs, errAbs := filepath.Abs(dst); errAbs == nil {
+					dst = abs
+				}
 			}
-		}
-		if errSave := c.SaveUploadedFile(file, dst); errSave != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to save file: %v", errSave)})
+			if errSave := c.SaveUploadedFile(file, dst); errSave != nil {
+				c.JSON(500, gin.H{"error": fmt.Sprintf("failed to save file: %v", errSave)})
+				return
+			}
+			data, errRead := os.ReadFile(dst)
+			if errRead != nil {
+				c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read saved file: %v", errRead)})
+				return
+			}
+			if errReg := h.registerAuthFromFile(ctx, dst, data); errReg != nil {
+				c.JSON(500, gin.H{"error": errReg.Error()})
+				return
+			}
+			c.JSON(200, gin.H{"status": "ok"})
+			return
+		case ".zip":
+			src, errOpen := file.Open()
+			if errOpen != nil {
+				c.JSON(500, gin.H{"error": fmt.Sprintf("failed to open uploaded archive: %v", errOpen)})
+				return
+			}
+			defer func() { _ = src.Close() }()
+			data, errRead := io.ReadAll(src)
+			if errRead != nil {
+				c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read uploaded archive: %v", errRead)})
+				return
+			}
+			imported, results, errImport := h.importAuthZip(ctx, data)
+			if errImport != nil {
+				c.JSON(500, gin.H{"error": errImport.Error(), "imported": imported, "results": results})
+				return
+			}
+			c.JSON(200, gin.H{"status": "ok", "imported": imported, "results": results})
+			return
+		default:
+			c.JSON(400, gin.H{"error": "file must be .json or .zip"})
 			return
 		}
-		data, errRead := os.ReadFile(dst)
-		if errRead != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read saved file: %v", errRead)})
-			return
-		}
-		if errReg := h.registerAuthFromFile(ctx, dst, data); errReg != nil {
-			c.JSON(500, gin.H{"error": errReg.Error()})
-			return
-		}
-		c.JSON(200, gin.H{"status": "ok"})
-		return
 	}
 	name := c.Query("name")
 	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
@@ -771,6 +799,78 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	}
 	_, err := h.authManager.Register(ctx, auth)
 	return err
+}
+
+func (h *Handler) importAuthZip(ctx context.Context, archive []byte) (int, []authImportResult, error) {
+	if len(archive) == 0 {
+		return 0, nil, fmt.Errorf("uploaded archive is empty")
+	}
+	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		return 0, nil, fmt.Errorf("invalid zip archive: %w", err)
+	}
+
+	imported := 0
+	results := make([]authImportResult, 0, len(reader.File))
+	seenNames := make(map[string]string)
+	for _, entry := range reader.File {
+		if entry == nil || entry.FileInfo().IsDir() {
+			continue
+		}
+		entryName := filepath.ToSlash(strings.TrimSpace(entry.Name))
+		if entryName == "" || strings.Contains(entryName, "../") || strings.HasPrefix(entryName, "/") {
+			return imported, results, fmt.Errorf("invalid archive entry: %s", entry.Name)
+		}
+		baseName := filepath.Base(entryName)
+		if !strings.HasSuffix(strings.ToLower(baseName), ".json") {
+			continue
+		}
+		if previous, exists := seenNames[strings.ToLower(baseName)]; exists {
+			results = append(results, authImportResult{
+				Name:    entry.Name,
+				Status:  "failed",
+				Message: fmt.Sprintf("duplicate target filename %s conflicts with %s", baseName, previous),
+			})
+			continue
+		}
+		seenNames[strings.ToLower(baseName)] = entry.Name
+		rc, errOpen := entry.Open()
+		if errOpen != nil {
+			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to open: %v", errOpen)})
+			continue
+		}
+		data, errRead := io.ReadAll(rc)
+		_ = rc.Close()
+		if errRead != nil {
+			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to read: %v", errRead)})
+			continue
+		}
+
+		dst := filepath.Join(h.cfg.AuthDir, baseName)
+		if !filepath.IsAbs(dst) {
+			if abs, errAbs := filepath.Abs(dst); errAbs == nil {
+				dst = abs
+			}
+		}
+		if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to write %s: %v", baseName, errWrite)})
+			continue
+		}
+		if errReg := h.registerAuthFromFile(ctx, dst, data); errReg != nil {
+			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: errReg.Error()})
+			_ = os.Remove(dst)
+			continue
+		}
+		imported++
+		results = append(results, authImportResult{Name: entry.Name, Status: "imported"})
+	}
+	if imported == 0 {
+		if len(results) == 0 {
+			return 0, results, fmt.Errorf("no .json auth files found in archive")
+		}
+		return 0, results, fmt.Errorf("no auth files were imported successfully")
+	}
+	return imported, results, nil
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file

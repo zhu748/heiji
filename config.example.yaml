@@ -83,6 +83,10 @@ max-retry-credentials: 0
 # Maximum wait time in seconds for a cooled-down credential before triggering a retry.
 max-retry-interval: 30
 
+# When true, file-backed OAuth credentials that hit invalid-credential errors during requests
+# will be deleted automatically, without manual removal from the management panel.
+auto-delete-invalid-auth: false
+
 # Quota exceeded behavior
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded

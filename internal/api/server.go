@@ -581,6 +581,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/max-retry-interval", s.mgmt.GetMaxRetryInterval)
 		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
 		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
+		mgmt.GET("/auto-delete-invalid-auth", s.mgmt.GetAutoDeleteInvalidAuth)
+		mgmt.PUT("/auto-delete-invalid-auth", s.mgmt.PutAutoDeleteInvalidAuth)
+		mgmt.PATCH("/auto-delete-invalid-auth", s.mgmt.PutAutoDeleteInvalidAuth)
 
 		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
 		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)

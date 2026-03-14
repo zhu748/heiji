@@ -271,6 +271,14 @@ func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
 	h.updateIntField(c, func(v int) { h.cfg.MaxRetryInterval = v })
 }
 
+// AutoDeleteInvalidAuth
+func (h *Handler) GetAutoDeleteInvalidAuth(c *gin.Context) {
+	c.JSON(200, gin.H{"auto-delete-invalid-auth": h.cfg.AutoDeleteInvalidAuth})
+}
+func (h *Handler) PutAutoDeleteInvalidAuth(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.AutoDeleteInvalidAuth = v })
+}
+
 // ForceModelPrefix
 func (h *Handler) GetForceModelPrefix(c *gin.Context) {
 	c.JSON(200, gin.H{"force-model-prefix": h.cfg.ForceModelPrefix})

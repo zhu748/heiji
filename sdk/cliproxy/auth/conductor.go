@@ -849,6 +849,49 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
+// Delete removes an auth entry from runtime state and the backing store.
+func (m *Manager) Delete(ctx context.Context, id string) error {
+	if m == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+
+	var removed *Auth
+	m.mu.Lock()
+	if auth, ok := m.auths[id]; ok && auth != nil {
+		removed = auth.Clone()
+		delete(m.auths, id)
+		cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+		if cfg == nil {
+			cfg = &internalconfig.Config{}
+		}
+		m.rebuildAPIKeyModelAliasLocked(cfg)
+	}
+	m.mu.Unlock()
+
+	if removed == nil {
+		return nil
+	}
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(id)
+	}
+	registry.GetGlobalRegistry().UnregisterClient(id)
+
+	if shouldSkipPersist(ctx) || m.store == nil {
+		return nil
+	}
+	if removed.Attributes != nil && strings.EqualFold(strings.TrimSpace(removed.Attributes["runtime_only"]), "true") {
+		return nil
+	}
+	if removed.Metadata == nil {
+		return nil
+	}
+	return m.store.Delete(ctx, id)
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
@@ -1591,6 +1634,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	shouldAutoDeleteAuth := false
 	var authSnapshot *Auth
 
 	m.mu.Lock()
@@ -1682,12 +1726,28 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
+
+			if shouldAutoDeleteInvalidAuth(m.runtimeConfig.Load(), auth, result.Error) {
+				shouldAutoDeleteAuth = true
+			}
 		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+		if !shouldAutoDeleteAuth {
+			_ = m.persist(ctx, auth)
+			authSnapshot = auth.Clone()
+		}
 	}
 	m.mu.Unlock()
+	if shouldAutoDeleteAuth {
+		authID := result.AuthID
+		go func() {
+			if err := m.Delete(context.Background(), authID); err != nil {
+				logEntryWithRequestID(ctx).WithError(err).Warnf("failed to auto-delete invalid auth %s", authID)
+			} else {
+				logEntryWithRequestID(ctx).Warnf("auto-deleted invalid auth %s after credential error", authID)
+			}
+		}()
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -1705,6 +1765,51 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+}
+
+func shouldAutoDeleteInvalidAuth(cfgValue any, auth *Auth, err *Error) bool {
+	if auth == nil || err == nil || isAPIKeyAuth(auth) {
+		return false
+	}
+	if strings.TrimSpace(auth.FileName) == "" {
+		if auth.Attributes == nil || strings.TrimSpace(auth.Attributes["path"]) == "" {
+			return false
+		}
+	}
+	cfg, _ := cfgValue.(*internalconfig.Config)
+	if cfg == nil || !cfg.AutoDeleteInvalidAuth {
+		return false
+	}
+	return isInvalidCredentialError(err)
+}
+
+func isInvalidCredentialError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.HTTPStatus {
+	case http.StatusUnauthorized:
+		return true
+	case http.StatusForbidden:
+		message := strings.ToLower(strings.TrimSpace(err.Message))
+		for _, needle := range []string{
+			"invalid api key",
+			"invalid_api_key",
+			"invalid access token",
+			"invalid token",
+			"access token expired",
+			"refresh token",
+			"authentication",
+			"unauthorized",
+			"credential",
+			"token expired",
+		} {
+			if strings.Contains(message, needle) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
