@@ -531,6 +531,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	asyncImport := isTruthyQuery(c.Query("async"))
 	if file, err := c.FormFile("file"); err == nil && file != nil {
 		name := filepath.Base(file.Filename)
 		switch strings.ToLower(filepath.Ext(name)) {
@@ -566,6 +567,22 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 			data, errRead := io.ReadAll(src)
 			if errRead != nil {
 				c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read uploaded archive: %v", errRead)})
+				return
+			}
+			if asyncImport {
+				total, errCount := countAuthZipEntries(data)
+				if errCount != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": errCount.Error()})
+					return
+				}
+				job := h.createAuthImportJob(name, total)
+				go h.runAuthImportJob(job, data)
+				c.JSON(http.StatusAccepted, gin.H{
+					"status":    "accepted",
+					"job_id":    job.ID,
+					"file_name": name,
+					"total":     total,
+				})
 				return
 			}
 			imported, results, errImport := h.importAuthZip(ctx, data)
@@ -609,6 +626,20 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func (h *Handler) GetAuthFileImportJob(c *gin.Context) {
+	jobID := strings.TrimSpace(c.Param("id"))
+	if jobID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "job id is required"})
+		return
+	}
+	job, ok := h.getAuthImportJob(jobID)
+	if !ok || job == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "import job not found"})
+		return
+	}
+	c.JSON(http.StatusOK, job.snapshot(true))
 }
 
 // Delete auth files: single by name or all
@@ -802,6 +833,40 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 }
 
 func (h *Handler) importAuthZip(ctx context.Context, archive []byte) (int, []authImportResult, error) {
+	return h.importAuthZipWithProgress(ctx, archive, nil)
+}
+
+func countAuthZipEntries(archive []byte) (int, error) {
+	if len(archive) == 0 {
+		return 0, fmt.Errorf("uploaded archive is empty")
+	}
+	reader, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		return 0, fmt.Errorf("invalid zip archive: %w", err)
+	}
+
+	total := 0
+	for _, entry := range reader.File {
+		if entry == nil || entry.FileInfo().IsDir() {
+			continue
+		}
+		entryName := filepath.ToSlash(strings.TrimSpace(entry.Name))
+		if entryName == "" || strings.Contains(entryName, "../") || strings.HasPrefix(entryName, "/") {
+			return 0, fmt.Errorf("invalid archive entry: %s", entry.Name)
+		}
+		baseName := filepath.Base(entryName)
+		if !strings.HasSuffix(strings.ToLower(baseName), ".json") {
+			continue
+		}
+		total++
+	}
+	if total == 0 {
+		return 0, fmt.Errorf("no .json auth files found in archive")
+	}
+	return total, nil
+}
+
+func (h *Handler) importAuthZipWithProgress(ctx context.Context, archive []byte, onProgress func(authImportResult)) (int, []authImportResult, error) {
 	if len(archive) == 0 {
 		return 0, nil, fmt.Errorf("uploaded archive is empty")
 	}
@@ -813,6 +878,15 @@ func (h *Handler) importAuthZip(ctx context.Context, archive []byte) (int, []aut
 	imported := 0
 	results := make([]authImportResult, 0, len(reader.File))
 	seenNames := make(map[string]string)
+	recordResult := func(result authImportResult) {
+		results = append(results, result)
+		if result.Status == "imported" {
+			imported++
+		}
+		if onProgress != nil {
+			onProgress(result)
+		}
+	}
 	for _, entry := range reader.File {
 		if entry == nil || entry.FileInfo().IsDir() {
 			continue
@@ -826,7 +900,7 @@ func (h *Handler) importAuthZip(ctx context.Context, archive []byte) (int, []aut
 			continue
 		}
 		if previous, exists := seenNames[strings.ToLower(baseName)]; exists {
-			results = append(results, authImportResult{
+			recordResult(authImportResult{
 				Name:    entry.Name,
 				Status:  "failed",
 				Message: fmt.Sprintf("duplicate target filename %s conflicts with %s", baseName, previous),
@@ -836,13 +910,13 @@ func (h *Handler) importAuthZip(ctx context.Context, archive []byte) (int, []aut
 		seenNames[strings.ToLower(baseName)] = entry.Name
 		rc, errOpen := entry.Open()
 		if errOpen != nil {
-			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to open: %v", errOpen)})
+			recordResult(authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to open: %v", errOpen)})
 			continue
 		}
 		data, errRead := io.ReadAll(rc)
 		_ = rc.Close()
 		if errRead != nil {
-			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to read: %v", errRead)})
+			recordResult(authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to read: %v", errRead)})
 			continue
 		}
 
@@ -853,16 +927,15 @@ func (h *Handler) importAuthZip(ctx context.Context, archive []byte) (int, []aut
 			}
 		}
 		if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to write %s: %v", baseName, errWrite)})
+			recordResult(authImportResult{Name: entry.Name, Status: "failed", Message: fmt.Sprintf("failed to write %s: %v", baseName, errWrite)})
 			continue
 		}
 		if errReg := h.registerAuthFromFile(ctx, dst, data); errReg != nil {
-			results = append(results, authImportResult{Name: entry.Name, Status: "failed", Message: errReg.Error()})
+			recordResult(authImportResult{Name: entry.Name, Status: "failed", Message: errReg.Error()})
 			_ = os.Remove(dst)
 			continue
 		}
-		imported++
-		results = append(results, authImportResult{Name: entry.Name, Status: "imported"})
+		recordResult(authImportResult{Name: entry.Name, Status: "imported"})
 	}
 	if imported == 0 {
 		if len(results) == 0 {
@@ -871,6 +944,25 @@ func (h *Handler) importAuthZip(ctx context.Context, archive []byte) (int, []aut
 		return 0, results, fmt.Errorf("no auth files were imported successfully")
 	}
 	return imported, results, nil
+}
+
+func (h *Handler) runAuthImportJob(job *authImportJob, archive []byte) {
+	if job == nil {
+		return
+	}
+	_, _, err := h.importAuthZipWithProgress(context.Background(), archive, func(result authImportResult) {
+		job.addResult(result)
+	})
+	job.complete(err)
+}
+
+func isTruthyQuery(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file

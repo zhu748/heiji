@@ -40,6 +40,8 @@ type Handler struct {
 	mu                  sync.Mutex
 	attemptsMu          sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
+	importJobsMu        sync.RWMutex
+	importJobs          map[string]*authImportJob
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
 	tokenStore          coreauth.Store
@@ -59,6 +61,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		cfg:                 cfg,
 		configFilePath:      configFilePath,
 		failedAttempts:      make(map[string]*attemptInfo),
+		importJobs:          make(map[string]*authImportJob),
 		authManager:         manager,
 		usageStats:          usage.GetRequestStatistics(),
 		tokenStore:          sdkAuth.GetTokenStore(),
@@ -77,6 +80,7 @@ func (h *Handler) startAttemptCleanup() {
 		defer ticker.Stop()
 		for range ticker.C {
 			h.purgeStaleAttempts()
+			h.purgeExpiredImportJobs()
 		}
 	}()
 }
