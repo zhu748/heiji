@@ -42,6 +42,8 @@ type Handler struct {
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	importJobsMu        sync.RWMutex
 	importJobs          map[string]*authImportJob
+	quotaJobsMu         sync.RWMutex
+	quotaJobs           map[string]*quotaRefreshJob
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
 	tokenStore          coreauth.Store
@@ -62,6 +64,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		configFilePath:      configFilePath,
 		failedAttempts:      make(map[string]*attemptInfo),
 		importJobs:          make(map[string]*authImportJob),
+		quotaJobs:           make(map[string]*quotaRefreshJob),
 		authManager:         manager,
 		usageStats:          usage.GetRequestStatistics(),
 		tokenStore:          sdkAuth.GetTokenStore(),
@@ -81,6 +84,7 @@ func (h *Handler) startAttemptCleanup() {
 		for range ticker.C {
 			h.purgeStaleAttempts()
 			h.purgeExpiredImportJobs()
+			h.purgeExpiredQuotaJobs()
 		}
 	}()
 }
