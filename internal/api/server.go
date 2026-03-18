@@ -630,6 +630,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
+		mgmt.GET("/auth-files/import-jobs", s.mgmt.ListAuthFileImportJobs)
 		mgmt.GET("/auth-files/import-jobs/:id", s.mgmt.GetAuthFileImportJob)
 		mgmt.POST("/quota-refresh-jobs", s.mgmt.StartQuotaRefreshJob)
 		mgmt.GET("/quota-refresh-jobs/:id", s.mgmt.GetQuotaRefreshJob)

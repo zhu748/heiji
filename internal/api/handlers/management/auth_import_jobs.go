@@ -3,6 +3,7 @@ package management
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"sort"
 	"sync"
 	"time"
 )
@@ -26,17 +27,18 @@ type authImportJob struct {
 }
 
 type authImportJobSnapshot struct {
-	ID        string             `json:"job_id"`
-	FileName  string             `json:"file_name,omitempty"`
-	Status    string             `json:"status"`
-	Total     int                `json:"total"`
-	Processed int                `json:"processed"`
-	Imported  int                `json:"imported"`
-	Failed    int                `json:"failed"`
-	Results   []authImportResult `json:"results,omitempty"`
-	Error     string             `json:"error,omitempty"`
-	CreatedAt time.Time          `json:"created_at"`
-	UpdatedAt time.Time          `json:"updated_at"`
+	ID          string             `json:"job_id"`
+	FileName    string             `json:"file_name,omitempty"`
+	Status      string             `json:"status"`
+	Total       int                `json:"total"`
+	Processed   int                `json:"processed"`
+	Imported    int                `json:"imported"`
+	Failed      int                `json:"failed"`
+	Results     []authImportResult `json:"results,omitempty"`
+	Error       string             `json:"error,omitempty"`
+	CreatedAt   time.Time          `json:"created_at"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+	CompletedAt time.Time          `json:"completed_at,omitempty"`
 }
 
 func newAuthImportJobID() string {
@@ -69,6 +71,36 @@ func (h *Handler) getAuthImportJob(id string) (*authImportJob, bool) {
 	job, ok := h.importJobs[id]
 	h.importJobsMu.RUnlock()
 	return job, ok
+}
+
+func (h *Handler) listAuthImportJobs(limit int, includeResults bool) []authImportJobSnapshot {
+	h.importJobsMu.RLock()
+	jobs := make([]*authImportJob, 0, len(h.importJobs))
+	for _, job := range h.importJobs {
+		if job != nil {
+			jobs = append(jobs, job)
+		}
+	}
+	h.importJobsMu.RUnlock()
+
+	snapshots := make([]authImportJobSnapshot, 0, len(jobs))
+	for _, job := range jobs {
+		snapshots = append(snapshots, job.snapshot(includeResults))
+	}
+
+	sort.Slice(snapshots, func(i, j int) bool {
+		left := snapshots[i].UpdatedAt
+		right := snapshots[j].UpdatedAt
+		if left.Equal(right) {
+			return snapshots[i].CreatedAt.After(snapshots[j].CreatedAt)
+		}
+		return left.After(right)
+	})
+
+	if limit > 0 && len(snapshots) > limit {
+		snapshots = snapshots[:limit]
+	}
+	return snapshots
 }
 
 func (h *Handler) purgeExpiredImportJobs() {
@@ -127,16 +159,17 @@ func (job *authImportJob) snapshot(includeResults bool) authImportJobSnapshot {
 	defer job.mu.RUnlock()
 
 	snapshot := authImportJobSnapshot{
-		ID:        job.ID,
-		FileName:  job.FileName,
-		Status:    job.Status,
-		Total:     job.Total,
-		Processed: job.Processed,
-		Imported:  job.Imported,
-		Failed:    job.Failed,
-		Error:     job.Error,
-		CreatedAt: job.CreatedAt,
-		UpdatedAt: job.UpdatedAt,
+		ID:          job.ID,
+		FileName:    job.FileName,
+		Status:      job.Status,
+		Total:       job.Total,
+		Processed:   job.Processed,
+		Imported:    job.Imported,
+		Failed:      job.Failed,
+		Error:       job.Error,
+		CreatedAt:   job.CreatedAt,
+		UpdatedAt:   job.UpdatedAt,
+		CompletedAt: job.CompletedAt,
 	}
 	if includeResults && len(job.Results) > 0 {
 		snapshot.Results = append([]authImportResult(nil), job.Results...)

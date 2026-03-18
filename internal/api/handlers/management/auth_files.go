@@ -642,6 +642,22 @@ func (h *Handler) GetAuthFileImportJob(c *gin.Context) {
 	c.JSON(http.StatusOK, job.snapshot(true))
 }
 
+func (h *Handler) ListAuthFileImportJobs(c *gin.Context) {
+	limit := 20
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			if parsed > 100 {
+				parsed = 100
+			}
+			limit = parsed
+		}
+	}
+	includeResults := isTruthyQuery(c.Query("include_results"))
+	c.JSON(http.StatusOK, gin.H{
+		"jobs": h.listAuthImportJobs(limit, includeResults),
+	})
+}
+
 // Delete auth files: single by name or all
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	if h.authManager == nil {

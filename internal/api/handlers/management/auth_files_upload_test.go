@@ -279,3 +279,47 @@ func TestUploadAuthFile_ZipArchiveAsyncImportReportsProgress(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 }
+
+func TestListAuthFileImportJobs_ReturnsRecentJobs(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+
+	first := h.createAuthImportJob("older.zip", 1)
+	first.complete(nil)
+	time.Sleep(10 * time.Millisecond)
+	second := h.createAuthImportJob("newer.zip", 2)
+	second.addResult(authImportResult{Name: "one.json", Status: "imported"})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/import-jobs?limit=1", nil)
+
+	h.ListAuthFileImportJobs(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Jobs []struct {
+			JobID     string `json:"job_id"`
+			FileName  string `json:"file_name"`
+			Status    string `json:"status"`
+			Processed int    `json:"processed"`
+		} `json:"jobs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(payload.Jobs))
+	}
+	if payload.Jobs[0].JobID != second.ID || payload.Jobs[0].FileName != "newer.zip" {
+		t.Fatalf("expected newest job first, got %+v", payload.Jobs[0])
+	}
+	if payload.Jobs[0].Status != "processing" || payload.Jobs[0].Processed != 1 {
+		t.Fatalf("unexpected job payload: %+v", payload.Jobs[0])
+	}
+}
